@@ -1,4 +1,12 @@
 Config:
+    # Domain name of the project, used to generate UUIDs, required!
+    # for cds use: caninecommons.cancer.gov
+    # for CTDC use: trialcommons.cancer.gov
+    # for Bento reference implementation use: bento-tools.org
+
+  domain: 'caninecommons.cancer.gov'
+    # adapter_module: adapters.local_adapter
+    # adapter_class: BentoLocalConfig:
   temp_folder: tmp
   backup_folder: /tmp/data-loader-backups
 
@@ -8,12 +16,12 @@ Config:
     # Neo4j username
     user: neo4j
     # Neo4j password
-    password:
+    password: test123
 
   # Schema files' locations
   schema:
-    - examples/icdc/data-model/icdc-model.yml
-    - examples/icdc/data-model/icdc-model-props.yml
+    - examples/cds/data-model/cds-model.yml
+    - examples/cds/data-model/cds-model-props.yml
 
   plugins:
     - module: loader_plugins.visit_creator
@@ -22,12 +30,12 @@ Config:
       class: IndividualCreator
 
   #Property file location
-  prop_file: config/props-icdc-pmvp.yml
+  prop_file: config/props-cds.yml
 
   # Skip validations, aka. Cheat Mode
   cheat_mode: false
   # Validations only, skip loading
-  dry_run: false
+  dry_run: true
   # Wipe out database before loading, you'll lose all data!
   wipe_db: false
   # Skip backup step
@@ -35,13 +43,16 @@ Config:
   # Automatically confirm deletion and database wiping (without asking user to confirm)
   no_confirmation: false
   # Max violations to display, default is 10
-  max_violations: 10
+  max_violations: 1000000
 
   # S3 bucket name, if you are loading from an S3 bucket
   s3_bucket:
   # S3 folder for dataset
   s3_folder:
-  # Loading mode, can be "upsert", "new" or "delete", default is "upsert"
-  loading_mode: upsert
+  # Loading mode, can be UPSERT_MODE, NEW_MODE or DELETE_MODE, default is UPSERT_MODE
+  loading_mode: UPSERT_MODE
   # Location of dataset
-  dataset: examples/icdc/dataset
+  dataset: ../../testdata/cds_data_2023-8-31-August
+  # destination dir to upload log file. Two options: 1) local dir 2) s3 bucket dir start with 's3://''
+  # s3://[bucket]/[folder1/forlder2/...]
+  upload_log_dir: s3://dhloadertest/00002/matedata/log

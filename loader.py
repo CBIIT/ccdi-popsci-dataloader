@@ -3,6 +3,7 @@ import argparse
 import glob
 import os
 import sys
+import zipfile
 
 from neo4j import GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
@@ -20,10 +21,13 @@ os.environ[APP_NAME] = 'Data_Loader'
 
 from config import BentoConfig
 from data_loader import DataLoader
-from bento.common.s3 import S3Bucket
+from bento.common.s3 import S3Bucket, upload_log_file
+
+DEFAULT_MAX_VIOLATIONS = 1000000
+DEFAULT_TEMP_FOLDER = "tmp"
 
 
-def parse_arguments():
+def parse_arguments(args = None):
     parser = argparse.ArgumentParser(description='Load TSV(TXT) files (from Pentaho) into Neo4j')
     parser.add_argument('-i', '--uri', help='Neo4j uri like bolt://12.34.56.78:7687')
     parser.add_argument('-u', '--user', help='Neo4j user')
@@ -38,16 +42,17 @@ def parse_arguments():
     parser.add_argument('--wipe-db', help='Wipe out database before loading, you\'ll lose all data!',
                         action='store_true')
     parser.add_argument('--no-backup', help='Skip backup step', action='store_true')
+    parser.add_argument('-v', '--verbose', help='Print the whole list of permissive values when the value is non-permissive value', action='store_true')
     parser.add_argument('-y', '--yes', help='Automatically confirm deletion and database wiping', action='store_true')
     parser.add_argument('-M', '--max-violations', help='Max violations to display', nargs='?', type=int)
     parser.add_argument('-b', '--bucket', help='S3 bucket name')
     parser.add_argument('-f', '--s3-folder', help='S3 folder')
-    parser.add_argument('-m', '--mode', help='Loading mode', choices=[UPSERT_MODE, NEW_MODE, DELETE_MODE],
-                        default=UPSERT_MODE)
+    parser.add_argument('-m', '--mode', help='Loading mode', choices=[UPSERT_MODE, NEW_MODE, DELETE_MODE])
     parser.add_argument('--dataset', help='Dataset directory')
     parser.add_argument('--split-transactions', help='Creates a separate transaction for each file',
                         action='store_true')
-    return parser.parse_args()
+    parser.add_argument('--upload-log-dir', help='Upload destination dir for log file,  if dir in s3, use the format, s3://[bucket]/[prefix]')
+    return parser.parse_args(args)
 
 
 def process_arguments(args, log):
@@ -62,6 +67,9 @@ def process_arguments(args, log):
     if not config.dataset:
         log.error('No dataset specified! Please specify a dataset in config file or with CLI argument --dataset')
         sys.exit(1)
+
+    if args.s3_folder:
+        config.s3_folder = args.s3_folder
     if not config.s3_folder and not os.path.isdir(config.dataset):
         log.error('{} is not a directory!'.format(config.dataset))
         sys.exit(1)
@@ -104,8 +112,6 @@ def process_arguments(args, log):
         log.error('Backup folder not specified! A backup folder is required unless the --no-backup argument is used')
         sys.exit(1)
 
-    if args.s3_folder:
-        config.s3_folder = args.s3_folder
     if config.s3_folder:
         if not os.path.exists(config.dataset):
             os.makedirs(config.dataset)
@@ -147,31 +153,39 @@ def process_arguments(args, log):
 
     if args.yes:
         config.yes = args.yes
-
+    if args.verbose:
+        config.verbose = args.verbose
     if args.dry_run:
         config.dry_run = args.dry_run
-
     if args.cheat_mode:
         config.cheat_mode = args.cheat_mode
 
     if args.mode:
         config.loading_mode = args.mode
     if not config.loading_mode:
-        config.loading_mode = "UPSERT_MODE"
+        config.loading_mode = UPSERT_MODE
 
     if args.max_violations:
         config.max_violations = int(args.max_violations)
     if not config.max_violations:
-        config.max_violations = 10
+        config.max_violations = DEFAULT_MAX_VIOLATIONS
+
+    if args.upload_log_dir:
+        config.upload_log_dir = args.upload_log_dir
+
+    # Only applies when running in Prefect via loader_prefect.py, which doesn't have config files and temp_foldetemp_folderr
+    # So plugins have to be passed in from Prefect parameters
+    # In that case args is an object that contains all Prefect parameters
+    if hasattr(args, 'plugins'):
+        config.plugins = args.plugins
+
+    if hasattr(args, 'temp_folder'):
+        config.temp_folder = args.temp_folder
+
+    if not config.temp_folder:
+        config.temp_folder = DEFAULT_TEMP_FOLDER
 
     return config
-
-
-def upload_log_file(bucket_name, folder, file_path):
-    base_name = os.path.basename(file_path)
-    s3 = S3Bucket(bucket_name)
-    key = f'{folder}/{base_name}'
-    return s3.upload_file(key, file_path)
 
 def prepare_plugin(config, schema):
     if not config.params:
@@ -183,10 +197,10 @@ def prepare_plugin(config, schema):
 # Data loader will try to load all TSV(.TXT) files from given directory into Neo4j
 # optional arguments includes:
 # -i or --uri followed by Neo4j server address and port in format like bolt://12.34.56.78:7687
-def main():
+def main(args):
     log = get_logger('Loader')
     log_file = get_log_file()
-    config = process_arguments(parse_arguments(), log)
+    config = process_arguments(args, log)
     print_config(log, config)
 
     if not check_schema_files(config.schema_files, log):
@@ -194,6 +208,7 @@ def main():
 
     driver = None
     restore_cmd = ''
+    load_result = None
     try:
         txt_files = glob.glob('{}/*.txt'.format(config.dataset))
         tsv_files = glob.glob('{}/*.tsv'.format(config.dataset))
@@ -227,15 +242,24 @@ def main():
             loader = DataLoader(driver, schema, plugins)
 
             load_result = loader.load(file_list, config.cheat_mode, config.dry_run, config.loading_mode, config.wipe_db,
-                        config.max_violations, split=config.split_transactions,
+                        config.max_violations, config.temp_folder, config.verbose, split=config.split_transactions,
                         no_backup=config.no_backup, neo4j_uri=config.neo4j_uri, backup_folder=config.backup_folder)
-            if driver:
-                driver.close()
-            if restore_cmd:
-                log.info(restore_cmd)
+            
             if load_result == False:
-                log.error('Data files upload failed')
-                sys.exit(1)
+                if loader.validation_result_file_key != "":
+                    zip_file_key = loader.validation_result_file_key.replace(".xlsx", ".zip")
+                    with zipfile.ZipFile(zip_file_key, 'w') as zipf:
+                        zipf.write(loader.validation_result_file_key, os.path.basename(loader.validation_result_file_key))
+                        zipf.write(log_file, os.path.basename(log_file))
+                    log.error('Data loading failed, validation result zip file was created at {}'.format(zip_file_key))
+                else:
+                    log.error('Data loading failed')
+            else:
+                zip_file_key = log_file.replace(".log", ".zip")
+                with zipfile.ZipFile(zip_file_key, 'w') as zipf:
+                    zipf.write(log_file, os.path.basename(log_file))
+                log.info('Data loading succeeded, zip file was created at {}'.format(zip_file_key))
+
         else:
             log.info('No files to load.')
 
@@ -255,13 +279,33 @@ def main():
         if restore_cmd:
             log.info(restore_cmd)
 
-    if config.s3_bucket and config.s3_folder:
-        result = upload_log_file(config.s3_bucket, f'{config.s3_folder}/logs', log_file)
-        if result:
-            log.info(f'Uploading log file {log_file} succeeded!')
-        else:
-            log.error(f'Uploading log file {log_file} failed!')
+    log_file = get_log_file()
+    dest_log_dir = None
+    #check if uploaded dir is configured
+    if config.upload_log_dir:
+        dest_log_dir = config.upload_log_dir
+    else:
+        #check if s3 bucket/folder are set.
+        if config.s3_bucket and config.s3_folder: 
+            dest_log_dir = f's3://{config.s3_bucket}/{config.s3_folder}/logs'
 
+    if dest_log_dir:
+        try:
+            if load_result == False:
+                if loader.validation_result_file_key != "":
+                    upload_log_file(dest_log_dir, zip_file_key)
+                    log.info(f'Uploading validation result zip file {zip_file_key} succeeded!')
+            else:
+                upload_log_file(dest_log_dir, zip_file_key)
+                log.info(f'Uploading validation result zip file {zip_file_key} succeeded!')
+            # upload_log_file(dest_log_dir, log_file)
+            log.info(f'Uploading log file {log_file} succeeded!')
+        except Exception as e:
+            log.debug(e)
+            log.exception('Copy file failed! Check debug log for detailed information')
+
+    if load_result == False:
+        sys.exit(1)
 
 def confirm_deletion(message):
     print(message)
@@ -271,4 +315,4 @@ def confirm_deletion(message):
 
 
 if __name__ == '__main__':
-    main()
+    main(parse_arguments())

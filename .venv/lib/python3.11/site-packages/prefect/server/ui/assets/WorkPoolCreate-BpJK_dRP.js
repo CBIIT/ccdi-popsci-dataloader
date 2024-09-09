@@ -1,0 +1,2 @@
+import{d as r,c as s,k as e,l as n,o as l,m as o,n as a,d0 as u,d1 as _}from"./index-Bmh-b1Uc.js";import{u as c}from"./usePageTitle-BBbs2JPu.js";const k=r({__name:"WorkPoolCreate",setup(p){return c("Create Work Pool"),(d,m)=>{const t=n("p-layout-default");return l(),s(t,null,{header:e(()=>[o(a(u))]),default:e(()=>[o(a(_))]),_:1})}}});export{k as default};
+//# sourceMappingURL=WorkPoolCreate-BpJK_dRP.js.map

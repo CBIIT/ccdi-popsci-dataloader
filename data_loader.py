@@ -1108,8 +1108,8 @@ class DataLoader:
                 provided_parents = results[PROVIDED_PARENTS]
                 relationship_props = results[RELATIONSHIP_PROPS]
                 if provided_parents > 0:
-                    if len(relationships) == 0:
-                        raise Exception('Line: {}: No parents found, abort loading!'.format(line_num))
+                    # if len(relationships) == 0:
+                    #     raise Exception('Line: {}: No parents found, abort loading!'.format(line_num))
                     for relationship in relationships:
                         relationship_name = relationship[RELATIONSHIP_TYPE]
                         multiplier = relationship[MULTIPLIER]

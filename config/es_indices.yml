@@ -493,3 +493,90 @@ Indices:
       min(study_demo.study_participant_minimum_age) as participant_minimum_age_lower_bound,
       max(study_demo.study_participant_maximum_age) as participant_maximum_age_upper_bound
       "
+  - index_name: neoplasm_query
+    type: neo4j
+    # type mapping for each property of the index
+    mapping:
+      primary_diagnosis_disease_term:
+        type: keyword
+      study_short_name:
+        type: keyword
+      study_type:
+        type: keyword
+      number_of_participants:
+        type: integer
+      biospecimen_collection:
+        type: keyword
+      data_collection_category:
+        type: keyword
+      data_file_uuid:
+        type: keyword
+      enrollment_beginning_year:
+        type: integer
+      enrollment_ending_year:
+        type: keyword
+      study_beginning_year:
+        type: integer
+      study_ending_year:
+        type: integer
+      study_design:
+        type: keyword
+      study_status:
+        type: keyword
+      study_country:
+        type: keyword
+      study_participant_maximum_age:
+        type: float
+      study_participant_median_age:
+        type: float
+      study_participant_minimum_age:
+        type: float
+      races:
+        type: keyword
+      ethnicities:
+        type: keyword
+      sexes:
+        type: keyword
+      genders:
+        type: keyword
+      
+    # Cypher query will be used to retrieve data from Neo4j, and index into Elasticsearch
+    cypher_query: "
+      MATCH (study:study)
+      OPTIONAL MATCH (study)<-[:associated_with]-(data:data_file)
+      MATCH (study)<-[:associated_with]-(neoplasm:primary_diagnosis)
+      OPTIONAL MATCH (study)<-[:associated_with]-(data_collection:data_collection)
+      WHERE data_collection.data_collection_category_annotation_count <> 0 and data_collection.data_collection_category_annotation_count is not null
+      optional MATCH (study)<-[:associated_with]-(study_demo:study_demographic)
+      optional MATCH (study)<-[:associated_with]-(country:study_country)
+      optional MATCH (study)<-[:associated_with]-(state:study_state_province_territory)
+      WHERE toLower(trim(study.study_ending_year)) CONTAINS 'ongoing'
+      SET study.study_ending_year = replace(study.study_ending_year, ' ', '')
+      SET study.study_ending_year = CASE
+      WHEN toLower(trim(study.study_ending_year)) CONTAINS 'ongoing' THEN REPLACE(toLower(trim(study.study_ending_year)),study.study_ending_year, '3000')
+      ELSE study.study_ending_year
+      END
+      RETURN
+      neoplasm.primary_diagnosis_disease_term as primary_diagnosis_disease_term,
+      study.study_short_name as study_short_name,
+      study.study_type as study_type,
+      study.study_design as study_design,
+      COLLECT(DISTINCT(study.biospecimen_collection)) as biospecimen_collection,
+      COLLECT(DISTINCT(data.data_file_uuid)) as data_file_uuid,
+      COLLECT(DISTINCT(study.number_of_participants)) as number_of_participants,
+      COLLECT(DISTINCT(data_collection.data_collection_category)) as data_collection_category,
+      COLLECT(DISTINCT(study.enrollment_beginning_year)) as enrollment_beginning_year,
+      COLLECT(DISTINCT(study.enrollment_ending_year)) as enrollment_ending_year,
+      COLLECT(DISTINCT(study.study_ending_year)) as study_ending_year,
+      COLLECT(DISTINCT(study.study_beginning_year)) as study_beginning_year,
+      COLLECT(DISTINCT(study.study_status)) as study_status,
+      Collect(distinct(country.study_country)) as study_country,
+      Collect(distinct(study_demo.study_participant_maximum_age)) as study_participant_maximum_age,
+      Collect(distinct(study_demo.study_participant_median_age)) as study_participant_median_age,
+      Collect(distinct(study_demo.study_participant_minimum_age)) as study_participant_minimum_age,
+      split(study_demo.race, '|') AS races,
+      split(study_demo.ethnicity, '|') as ethnicities,
+      split(study_demo.sex, '|') as sexes,
+      split(study_demo.gender, '|') as genders
+      "
+  

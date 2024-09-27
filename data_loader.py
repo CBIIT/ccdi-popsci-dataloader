@@ -17,7 +17,7 @@ from bento.common.utils import get_host, DATETIME_FORMAT, reformat_date, get_tim
 
 from neo4j import Driver
 
-from icdc_schema import ICDC_Schema, is_parent_pointer, get_list_values
+from icdc_schema import ICDC_Schema, is_parent_pointer
 from bento.common.utils import get_logger, NODES_CREATED, RELATIONSHIP_CREATED, UUID, \
     RELATIONSHIP_TYPE, MULTIPLIER, ONE_TO_ONE, DEFAULT_MULTIPLIER, UPSERT_MODE, \
     NEW_MODE, DELETE_MODE, NODES_DELETED, RELATIONSHIP_DELETED, NODES_UPDATED, combined_dict_counters, \
@@ -38,7 +38,8 @@ INT_NODE_CREATED = 'int_node_created'
 PROVIDED_PARENTS = 'provided_parents'
 RELATIONSHIP_PROPS = 'relationship_properties'
 BATCH_SIZE = 1000
-
+OTHER = '__other__'
+csv.field_size_limit(sys.maxsize)
 
 def get_btree_indexes(session):
     """
@@ -175,6 +176,9 @@ class DataLoader:
         self.nodes_deleted_stat = {}
         self.relationships_deleted_stat = {}
         self.validation_result_file_key = ""
+        self.df_validation_dict = {}
+        self.skip_validation_flag = False
+        self.cheat_mode = True
 
     def check_files(self, file_list):
         if not file_list:
@@ -187,31 +191,75 @@ class DataLoader:
                     return False
             return True
 
-    def validate_files(self, cheat_mode, file_list, max_violations, temp_folder, verbose):
-        if not cheat_mode:
-            validation_failed = False
-            output_key_invalid = ""
-            df_validation_dict = {}
-            for txt in file_list:
-                validate_result, df_validation_dict = self.validate_file(txt, max_violations, df_validation_dict, verbose)
-                if not validate_result:
-                    self.log.error('Validating file "{}" failed!'.format(txt))
-                    validation_failed = True
-            if validation_failed:
-                if not os.path.exists(temp_folder):
-                    os.makedirs(temp_folder)
-                df_validation_result_file_key = os.path.basename(os.path.dirname(file_list[0]))
-                timestamp = get_time_stamp()
-                output_key_invalid = os.path.join(temp_folder, df_validation_result_file_key) + "_" + timestamp + ".xlsx"
-                #df_validation_result.to_csv(output_key_invalid, index=False)
-                writer=pd.ExcelWriter(output_key_invalid, engine='xlsxwriter', engine_kwargs={'options':{'strings_to_urls': False}})
-                for key in df_validation_dict.keys():
-                    sheet_name_new = key
-                    df_validation_dict[key].to_excel(writer,sheet_name=sheet_name_new, index=False)
-                writer.close()
+    def validate_delete_files(self, file_list):
+        validation_result = True
+        try:
+            with self.driver.session() as session:
+                for txt in file_list:
+                    file_encoding = check_encoding(txt)
+                    with open(txt, encoding=file_encoding) as in_file:
+                        reader = csv.DictReader(in_file, delimiter='\t')
+                        line_number = 1
+                        for org_obj in reader:
+                            line_number += 1
+                            obj = self.cleanup_node(org_obj)
+                            id_field = self.schema.get_id_field(obj)
+                            if id_field not in obj.keys():
+                                self.log.error(f'Line: {line_number}: Required id field {id_field} is missing, validation failed')
+                                return False
+                            elif obj[id_field] is None:
+                                self.log.error(f'Line: {line_number}: Required id field {id_field} is None, validation failed')
+                                return False
+                            if NODE_TYPE not in obj.keys():
+                                self.log.error(f'Line: {line_number}: Required node type field {NODE_TYPE} is missing, validation failed')
+                                return True
+                            elif obj[NODE_TYPE] is None:
+                                self.log.error(f'Line: {line_number}: Required node type field {NODE_TYPE} is None, validation failed')
+                                return False
+                            node_type = obj.get(NODE_TYPE, None)
+                            if not self.node_exists(session, node_type, id_field, obj[id_field]):
+                                self.log.error(f'Line: {line_number}: The node to be deleted (:{obj[NODE_TYPE]} {{{id_field}: "{obj[id_field]}"}}) not found in DB!, validation failed')
+                                validation_result = False
+                            
+        except Exception as e:
+            self.log.error(e)
+            self.log.error("Delete file validation failed, abort the deletion")
+            sys.exit(1)
+        return validation_result
 
-            self.validation_result_file_key = output_key_invalid
-            return not validation_failed
+
+    def validate_files(self, cheat_mode, loading_mode, file_list, max_violations, temp_folder, verbose):
+        if not cheat_mode:
+            if loading_mode != DELETE_MODE:
+                self.cheat_mode = False
+                validation_failed = False
+                output_key_invalid = ""
+                for txt in file_list:
+                    validate_result = self.validate_file(txt, max_violations, verbose)
+                    if not validate_result:
+                        self.log.error('Validating file "{}" failed!'.format(txt))
+                        validation_failed = True
+                if validation_failed:
+                    if not os.path.exists(temp_folder):
+                        os.makedirs(temp_folder)
+                    df_validation_result_file_key = os.path.basename(os.path.dirname(file_list[0]))
+                    timestamp = get_time_stamp()
+                    output_key_invalid = os.path.join(temp_folder, df_validation_result_file_key) + "_" + timestamp + ".xlsx"
+                    #df_validation_result.to_csv(output_key_invalid, index=False)
+                    writer=pd.ExcelWriter(output_key_invalid, engine='xlsxwriter', engine_kwargs={'options':{'strings_to_urls': False}})
+                    for key in self.df_validation_dict.keys():
+                        sheet_name_new = key
+                        self.df_validation_dict[key].to_excel(writer,sheet_name=sheet_name_new, index=False)
+                    writer.close()
+
+                self.validation_result_file_key = output_key_invalid
+                return not validation_failed
+            elif loading_mode == DELETE_MODE:
+                self.log.info("Start validation the delete file.")
+                validation_result = self.validate_delete_files(file_list)
+                if validation_result:
+                    self.log.info("Passed all delete file validation.")
+                return validation_result
         else:
             self.log.info('Cheat mode enabled, all validations skipped!')
             return True
@@ -221,7 +269,7 @@ class DataLoader:
         if not self.check_files(file_list):
             return False
         start = timer()
-        if not self.validate_files(cheat_mode, file_list, max_violations, temp_folder, verbose):
+        if not self.validate_files(cheat_mode, loading_mode, file_list, max_violations, temp_folder, verbose):
             return False
         if not no_backup and not dry_run:
             if not neo4j_uri:
@@ -250,6 +298,7 @@ class DataLoader:
         self.relationships_stat = {}
         self.nodes_deleted_stat = {}
         self.relationships_deleted_stat = {}
+        self.cheat_mode = True
         if not self.driver or not isinstance(self.driver, Driver):
             self.log.error('Invalid Neo4j Python Driver!')
             return False
@@ -327,12 +376,12 @@ class DataLoader:
     # Add uuid to nodes if one not exists
     # Add parent id(s)
     # Add extra properties for "value with unit" properties
-    def prepare_node(self, node):
+    def prepare_node(self, node, file_name):
         obj = self.cleanup_node(node)
-
         node_type = obj.get(NODE_TYPE, None)
         # Cleanup values for Boolean, Int and Float types
         if node_type:
+            df_validation_result = pd.DataFrame(columns=['File Name', 'Property', 'Value', 'Reason', 'Line Numbers', 'Severity'])
             for key, value in obj.items():
                 search_node_type = node_type
                 search_key = key
@@ -372,7 +421,7 @@ class DataLoader:
                         cleaned_value = None
                     obj[key] = cleaned_value
                 elif key_type == 'Array':
-                    items = get_list_values(value)
+                    items = self.schema.get_list_values(value)
                     # todo: need to transform items if item type is not string
                     obj[key] = json.dumps(items)
                 elif key_type == 'DateTime' or key_type == 'Date':
@@ -381,42 +430,59 @@ class DataLoader:
                     else:
                         cleaned_value = reformat_date(value)
                     obj[key] = cleaned_value
+            obj2 = {}
+            for key, value in obj.items():
+                obj2[key] = value
+                # Add parent id field(s) into node
+                if obj[NODE_TYPE] in self.schema.props.save_parent_id and is_parent_pointer(key):
+                    header = key.split('.')
+                    if len(header) > 2:
+                        self.log.warning('Column header "{}" has multiple periods!'.format(key))
+                        df_validation_result = self.update_field_validation_result(df_validation_result, file_name, "", "column_header_has_multiple_periods", "warning")
+                        if obj[NODE_TYPE] not in self.df_validation_dict.keys():
+                            self.df_validation_dict[obj[NODE_TYPE]] = df_validation_result
+                        else:
+                            self.df_validation_dict[obj[NODE_TYPE]] = pd.concat([self.df_validation_dict[obj[NODE_TYPE]], df_validation_result])
+                    field_name = header[1]
+                    parent = header[0]
+                    combined = '{}_{}'.format(parent, field_name)
+                    if field_name in obj:
+                        self.log.debug(
+                            '"{}" field is in both current node and parent "{}", use {} instead !'.format(key, parent,
+                                                                                                        combined))
+                        field_name = combined
+                    # Add an value for parent id
+                    obj2[field_name] = value
+                # Add extra properties if any
+                for extra_prop_name, extra_value in self.schema.get_extra_props(node_type, key, value).items():
+                    obj2[extra_prop_name] = extra_value
 
-        obj2 = {}
-        for key, value in obj.items():
-            obj2[key] = value
-            # Add parent id field(s) into node
-            if obj[NODE_TYPE] in self.schema.props.save_parent_id and is_parent_pointer(key):
-                header = key.split('.')
-                if len(header) > 2:
-                    self.log.warning('Column header "{}" has multiple periods!'.format(key))
-                field_name = header[1]
-                parent = header[0]
-                combined = '{}_{}'.format(parent, field_name)
-                if field_name in obj:
-                    self.log.debug(
-                        '"{}" field is in both current node and parent "{}", use {} instead !'.format(key, parent,
-                                                                                                      combined))
-                    field_name = combined
-                # Add an value for parent id
-                obj2[field_name] = value
-            # Add extra properties if any
-            for extra_prop_name, extra_value in self.schema.get_extra_props(node_type, key, value).items():
-                obj2[extra_prop_name] = extra_value
-
-        if UUID not in obj2:
-            id_field = self.schema.get_id_field(obj2)
-            id_value = self.schema.get_id(obj2)
-            node_type = obj2.get(NODE_TYPE)
-            if node_type:
-                if not id_value:
-                    obj2[UUID] = self.schema.get_uuid_for_node(node_type, self.get_signature(obj2))
-                elif id_field != UUID:
-                    obj2[UUID] = self.schema.get_uuid_for_node(node_type, id_value)
+            if UUID not in obj2:
+                id_field = self.schema.get_id_field(obj2)
+                id_value = self.schema.get_id(obj2)
+                node_type = obj2.get(NODE_TYPE)
+                if node_type:
+                    if not id_value:
+                        obj2[UUID] = self.schema.get_uuid_for_node(node_type, self.get_signature(obj2))
+                    elif id_field != UUID:
+                        obj2[UUID] = self.schema.get_uuid_for_node(node_type, id_value)
+                else:
+                    raise Exception('No "type" column in file')
+            return obj2
+        elif not self.cheat_mode:
+            self.log.error('No "type" column in file')
+            #sys.exit(1)
+            df_validation_result = pd.DataFrame(columns=['File Name', 'Property', 'Value', 'Reason', 'Line Numbers', 'Severity'])
+            df_validation_result = self.update_field_validation_result(df_validation_result, file_name, "", "type_column_missing", "error")
+            if OTHER not in self.df_validation_dict.keys():
+                self.df_validation_dict[OTHER] = df_validation_result
             else:
-                raise Exception('No "type" property in node')
-
-        return obj2
+                self.df_validation_dict[OTHER] = pd.concat([self.df_validation_dict[OTHER], df_validation_result])
+            self.skip_validation_flag = True
+            return obj
+        else: #if enable cheat mode and bypass the validation
+            self.log.error('No "type" column in file, abort loading')
+            sys.exit(1)
 
     def get_signature(self, node):
         result = []
@@ -440,7 +506,7 @@ class DataLoader:
                 validation_failed = False
                 violations = 0
                 for org_obj in reader:
-                    obj = self.prepare_node(org_obj)
+                    obj = self.prepare_node(org_obj, file_name)
                     line_num += 1
                     # Validate parent exist
                     if CASE_ID in obj:
@@ -470,7 +536,7 @@ class DataLoader:
                 violations = 0
                 for org_obj in reader:
                     line_num += 1
-                    obj = self.prepare_node(org_obj)
+                    obj = self.prepare_node(org_obj, file_name)
                     results = self.collect_relationships(obj, session, False, line_num)
                     relationships = results[RELATIONSHIPS]
                     provided_parents = results[PROVIDED_PARENTS]
@@ -505,14 +571,16 @@ class DataLoader:
         return node
 
     # Validate the field names
-    def validate_field_name(self, file_name, df_validation_dict):
+    def validate_field_name(self, file_name):
         df_validation_result = pd.DataFrame(columns=['File Name', 'Property', 'Value', 'Reason', 'Line Numbers', 'Severity'])
         file_encoding = check_encoding(file_name)
         with open(file_name, encoding=file_encoding) as in_file:
             reader = csv.DictReader(in_file, delimiter='\t')
             row = next(reader)
             row = self.cleanup_node(row)
-            row_prepare_node = self.prepare_node(row)
+            row_prepare_node = self.prepare_node(row, file_name)
+            if self.skip_validation_flag:
+                return False
             parent_pointer = []
             for key in row_prepare_node.keys():
                 if is_parent_pointer(key):
@@ -541,18 +609,18 @@ class DataLoader:
                     self.log.error('Parent pointer: "{}" not found in data model'.format(parent_error_field_name))
                     df_validation_result = self.update_field_validation_result(df_validation_result, file_name, parent_error_field_name, "parent_pointer_not_found_in_model", "error")
                 if len(df_validation_result) > 0:
-                    if row[NODE_TYPE] not in df_validation_dict.keys():
-                        df_validation_dict[row[NODE_TYPE]] = df_validation_result
+                    if row[NODE_TYPE] not in self.df_validation_dict.keys():
+                        self.df_validation_dict[row[NODE_TYPE]] = df_validation_result
                     else:
-                        df_validation_dict[row[NODE_TYPE]] = pd.concat([df_validation_dict[row[NODE_TYPE]], df_validation_result])
+                        self.df_validation_dict[row[NODE_TYPE]] = pd.concat([self.df_validation_dict[row[NODE_TYPE]], df_validation_result])
                 self.log.error('Parent pointer not found in the data model, abort loading!')
-                return False, df_validation_dict
+                return False
         if len(df_validation_result) > 0:
-            if row[NODE_TYPE] not in df_validation_dict.keys():
-                    df_validation_dict[row[NODE_TYPE]] = df_validation_result
+            if row[NODE_TYPE] not in self.df_validation_dict.keys():
+                    self.df_validation_dict[row[NODE_TYPE]] = df_validation_result
             else:
-                df_validation_dict[row[NODE_TYPE]] = pd.concat([df_validation_dict[row[NODE_TYPE]], df_validation_result])
-        return True, df_validation_dict
+                self.df_validation_dict[row[NODE_TYPE]] = pd.concat([self.df_validation_dict[row[NODE_TYPE]], df_validation_result])
+        return True
     # update field validation result
     def update_field_validation_result(self, df_validation_result, file_name, error_field_name, reason, severity):
         tmp_df_validation_result_field = pd.DataFrame()
@@ -563,7 +631,8 @@ class DataLoader:
         df_validation_result = pd.concat([df_validation_result, tmp_df_validation_result_field])
         return df_validation_result
     # Validate file
-    def validate_file(self, file_name, max_violations, df_validation_dict, verbose):
+    def validate_file(self, file_name, max_violations, verbose):
+        self.skip_validation_flag = False
         file_encoding = check_encoding(file_name)
         with open(file_name, encoding=file_encoding) as in_file:
             self.log.info('Validating file "{}" ...'.format(file_name))
@@ -573,9 +642,9 @@ class DataLoader:
             violations = 0
             ids = {}
             df_validation_result = pd.DataFrame(columns=['File Name', 'Property', 'Value', 'Reason', 'Line Numbers', 'Severity'])
-            field_validation_result, df_validation_dict = self.validate_field_name(file_name, df_validation_dict)
+            field_validation_result = self.validate_field_name(file_name)
             if not field_validation_result:
-                return False, df_validation_dict
+                return False
             df_invalid = pd.DataFrame(columns=['invalid_properties', 'invalid_values', 'invalid_reason', 'invalid_line_num', 'node_type'])
             df_missing = pd.DataFrame(columns=['missing_properties', 'missing_reason', 'missing_line_num', 'node_type'])
             df_duplicate_id = pd.DataFrame(columns=['duplicate_id', 'duplicate_reason', 'duplicate_id_field', 'duplicate_line_num', 'node_type'])
@@ -656,7 +725,7 @@ class DataLoader:
             df_duplicate_id['duplicate_id'] = duplicate_id
             df_duplicate_id['duplicate_reason'] = duplicate_reason
             df_duplicate_id['duplicate_line_num'] = duplicate_line_num
-            df_duplicate_id['duplicate_node_type'] = duplicate_node_type
+            df_duplicate_id['node_type'] = duplicate_node_type
             df_duplicate_id['duplicate_id_field'] = duplicate_id_field
             ''''''
             if len(df_invalid) > 0:
@@ -691,27 +760,12 @@ class DataLoader:
                 tmp_df_validation_result_duplicate['Severity'] = ["error"] * len(df_duplicate_id)
                 df_validation_result = pd.concat([df_validation_result, tmp_df_validation_result_duplicate])
             if len(df_validation_result) > 0:
-                if obj[NODE_TYPE] not in df_validation_dict.keys():
-                    df_validation_dict[obj[NODE_TYPE]] = df_validation_result
+                if obj[NODE_TYPE] not in self.df_validation_dict.keys():
+                    self.df_validation_dict[obj[NODE_TYPE]] = df_validation_result
                 else:
-                    df_validation_dict[obj[NODE_TYPE]] = pd.concat([df_validation_dict[obj[NODE_TYPE]], df_validation_result])
+                    self.df_validation_dict[obj[NODE_TYPE]] = pd.concat([self.df_validation_dict[obj[NODE_TYPE]], df_validation_result])
+            return not validation_failed
 
-            '''
-            if len(df_invalid) > 0:
-                output_key_invalid = os.path.join(data_validation_result_sub, os.path.basename(file_name).replace(os.path.splitext(os.path.basename(file_name))[1], "_invalid_values.csv"))
-                df_invalid = df_invalid.sort_values(by=['invalid_properties'])
-                df_invalid.drop_duplicates().to_csv(output_key_invalid, index=False)
-                self.log.error("Invalid values file was created in {}".format(output_key_invalid))
-            if len(df_missing) > 0:
-                output_key_missing = os.path.join(data_validation_result_sub, os.path.basename(file_name).replace(os.path.splitext(os.path.basename(file_name))[1], "_missing_properties.csv"))
-                df_missing = df_missing.sort_values(by=['missing_properties'])
-                df_missing.drop_duplicates().to_csv(output_key_missing, index=False)
-                self.log.error("Missing properties file was created in {}".format(output_key_missing))
-            if len(df_duplicate_id) > 0:
-                output_key_duplicate_id = os.path.join(data_validation_result_sub, os.path.basename(file_name).replace(os.path.splitext(os.path.basename(file_name))[1], "_duplicate_id.csv"))
-                df_duplicate_id.drop_duplicates().to_csv(output_key_duplicate_id, index=False) 
-                self.log.error("Duplicated ID file was created in {}".format(output_key_duplicate_id))'''
-            return not validation_failed, df_validation_dict
     def convert_line_num_list(self, line_num_list):
         if len(line_num_list) > 0:
             new_line_num_list = []
@@ -842,7 +896,7 @@ class DataLoader:
             for org_obj in reader:
                 line_num += 1
                 transaction_counter += 1
-                obj = self.prepare_node(org_obj)
+                obj = self.prepare_node(org_obj, file_name)
                 node_type = obj[NODE_TYPE]
                 node_id = self.schema.get_id(obj)
                 if not node_id:
@@ -1046,7 +1100,7 @@ class DataLoader:
             for org_obj in reader:
                 line_num += 1
                 transaction_counter += 1
-                obj = self.prepare_node(org_obj)
+                obj = self.prepare_node(org_obj, file_name)
                 node_type = obj[NODE_TYPE]
                 results = self.collect_relationships(obj, tx, True, line_num)
                 relationships = results[RELATIONSHIPS]
@@ -1054,8 +1108,8 @@ class DataLoader:
                 provided_parents = results[PROVIDED_PARENTS]
                 relationship_props = results[RELATIONSHIP_PROPS]
                 if provided_parents > 0:
-                    if len(relationships) == 0:
-                        raise Exception('Line: {}: No parents found, abort loading!'.format(line_num))
+                    # if len(relationships) == 0:
+                    #     raise Exception('Line: {}: No parents found, abort loading!'.format(line_num))
                     for relationship in relationships:
                         relationship_name = relationship[RELATIONSHIP_TYPE]
                         multiplier = relationship[MULTIPLIER]

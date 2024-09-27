@@ -20,7 +20,7 @@ SRC = 'Src'
 DEST = 'Dst'
 VALUE_TYPE = 'value_type'
 ITEM_TYPE = 'item_type'
-LIST_DELIMITER = '*'
+#LIST_DELIMITER = '|'
 LABEL_NEXT = 'next'
 NEXT_RELATIONSHIP = 'next'
 UNITS = 'units'
@@ -37,10 +37,6 @@ EX_MAX = 'exclusiveMaximum'
 DESCRIPTION = 'Desc'
 
 
-def get_list_values(list_str):
-    return [item.strip() for item in list_str.split(LIST_DELIMITER) if item.strip()]
-
-
 def is_parent_pointer(field_name):
     return re.fullmatch(r'\w+\.\w+', field_name) is not None
 
@@ -51,6 +47,7 @@ class ICDC_Schema:
             raise AssertionError
         self.props = props
         self.rel_prop_delimiter = props.rel_prop_delimiter
+        self.delimiter = props.delimiter
 
         if not yaml_files:
             raise Exception('File list is empty,could not initialize ICDC_Schema object!')
@@ -131,6 +128,8 @@ class ICDC_Schema:
 
         return {PROPERTIES: props, REQUIRED: required, PRIVATE: private}
 
+    def get_list_values(self, list_str):
+        return [item.strip() for item in list_str.split(self.delimiter) if item.strip()]
     def process_node(self, name, desc, is_relationship=False):
         """
         Process input node/relationship properties and save it in self.nodes
@@ -265,15 +264,17 @@ class ICDC_Schema:
                         if ITEM_TYPE in prop_desc:
                             item_type = self._get_item_type(prop_desc[ITEM_TYPE])
                             result[ITEM_TYPE] = item_type
-                        elif PROP_ENUM in prop_desc:
+                        if PROP_ENUM in prop_desc:
                             item_type = self._get_item_type(prop_desc[PROP_ENUM])
                             result[ITEM_TYPE] = item_type
                         if UNITS in prop_desc:
                             result[HAS_UNIT] = True
                 elif isinstance(prop_desc, list):
                     enum = set()
-                    for t in prop_desc:
-                        if not re.search(r'://', t):
+                    r_url = re.compile(r"://")
+                    url_list = list(filter(r_url.search, prop_desc))
+                    if not(len(prop_desc) == 1 and len(url_list) == 1):
+                        for t in prop_desc:
                             enum.add(t)
                     if len(enum) > 0:
                         result[ENUM] = enum
@@ -298,8 +299,10 @@ class ICDC_Schema:
             return {PROP_TYPE: self.map_type(item_type)}
         elif isinstance(item_type, list):
             enum = set()
-            for t in item_type:
-                if not re.search(r'://', t):
+            r_url = re.compile(r"://")
+            url_list = list(filter(r_url.search, item_type))
+            if not(len(item_type) == 1 and len(url_list) == 1):
+                for t in item_type:
                     enum.add(t)
             if len(enum) > 0:
                 return {PROP_TYPE: DEFAULT_TYPE, ENUM: enum}
@@ -439,20 +442,36 @@ class ICDC_Schema:
                 prop_type = properties[key]
                 type_validation_result, error_type = self._validate_type(prop_type, value)
                 if not type_validation_result:
-                    result['result'] = False
-                    result['invalid_values'].append(value)
-                    result['invalid_properties'].append(key)
-                    result['invalid_reason'].append(error_type)
-                    if not verbose:
-                        if error_type == "non_permissive_value":
+                    if type(error_type) is tuple:
+                        result['result'] = False
+                        result['invalid_values'].append(error_type[0])
+                        result['invalid_properties'].append(key)
+                        result['invalid_reason'].append(error_type[1])
+                        if not verbose:
+                            if error_type[1] == "non_permissive_value":
+                                result['messages'].append(
+                                    'Property: "{}":"{}" is not in permissible value list!'.format(key, error_type[0]))
+                            elif error_type[1] == "wrong_type":
+                                result['messages'].append(
+                                    'Property: "{}":"{}" is in wrong type!'.format(key, error_type[0]))
+                        else:
                             result['messages'].append(
-                                'Property: "{}":"{}" is not in permissible value list!'.format(key, value))
-                        elif error_type == "wrong_type":
-                            result['messages'].append(
-                                'Property: "{}":"{}" is in wrong type!'.format(key, value))
+                                'Property: "{}":"{}" is not a valid "{}" type!'.format(key, error_type[0], prop_type))
                     else:
-                        result['messages'].append(
-                            'Property: "{}":"{}" is not a valid "{}" type!'.format(key, value, prop_type))
+                        result['result'] = False
+                        result['invalid_values'].append(value)
+                        result['invalid_properties'].append(key)
+                        result['invalid_reason'].append(error_type)
+                        if not verbose:
+                            if error_type == "non_permissive_value":
+                                result['messages'].append(
+                                    'Property: "{}":"{}" is not in permissible value list!'.format(key, value))
+                            elif error_type == "wrong_type":
+                                result['messages'].append(
+                                    'Property: "{}":"{}" is in wrong type!'.format(key, value))
+                        else:
+                            result['messages'].append(
+                                'Property: "{}":"{}" is not a valid "{}" type!'.format(key, value, prop_type))
 
 
         return result
@@ -508,10 +527,14 @@ class ICDC_Schema:
                     and not re.match(r'\bltf\b', str_value, re.IGNORECASE)):
                 return False, wrong_type
         elif model_type[PROP_TYPE] == 'Array':
-            for item in get_list_values(str_value):
-                validation_result, error_type = self._validate_type(model_type[ITEM_TYPE], item)
-                if not validation_result:
-                    return False, wrong_type
+            for item in self.get_list_values(str_value):
+                if ENUM in model_type[ITEM_TYPE]:
+                    validation_result, error_type = self._validate_type(model_type[ITEM_TYPE], item)
+                    if not validation_result:
+                        return False, (item, error_type)
+                #validation_result, error_type = self._validate_type(model_type[ITEM_TYPE], item)
+                #if not validation_result:
+                #    return False, non_permissive_value
 
         elif model_type[PROP_TYPE] == 'Object':
             if not isinstance(str_value, dict):
@@ -637,4 +660,4 @@ class ICDC_Schema:
             return obj[id_field]
 
     def is_relationship_property(self, key):
-        return re.match(r'^.+\\{}.+$'.format(self.rel_prop_delimiter), key)
+        return re.match('^.+\{}.+$'.format(self.rel_prop_delimiter), key)
